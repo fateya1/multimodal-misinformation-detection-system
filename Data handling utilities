@@ -1,0 +1,499 @@
+"""
+Data utilities for the Multimodal Misinformation Detection System.
+
+This module provides functions for data preparation, preprocessing, and synthetic data generation
+for testing and demonstration purposes.
+
+Functions:
+    - generate_synthetic_dataset: Creates a synthetic dataset for development and testing
+    - create_stream_simulation: Creates a simulated stream of content for real-time processing
+    - load_case_study: Loads a specific case study for targeted evaluation
+    - preprocess_text: Text preprocessing utilities
+    - preprocess_image: Image preprocessing utilities
+"""
+
+import os
+import json
+import random
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+from datetime import datetime, timedelta
+from transformers import BertTokenizer
+
+class SocialMediaDataset(Dataset):
+    """Dataset for multimodal social media content."""
+    
+    def __init__(self, data_path, split='train', transform=None, tokenizer=None, max_length=512):
+        """
+        Args:
+            data_path: Path to the dataset
+            split: 'train', 'val', or 'test'
+            transform: Image transformations
+            tokenizer: Text tokenizer
+            max_length: Maximum length for text tokenization
+        """
+        self.data_path = data_path
+        self.split = split
+        self.transform = transform
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+        # Load metadata
+        metadata_path = os.path.join(data_path, f"{split}_metadata.json")
+        with open(metadata_path, 'r') as f:
+            self.metadata = json.load(f)
+        
+        self.samples = self.metadata['samples']
+        
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # Load text
+        text = sample['text']
+        
+        # Tokenize text
+        encoded_text = self.tokenizer(
+            text,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        # Extract relevant tensors and squeeze batch dimension
+        input_ids = encoded_text['input_ids'].squeeze(0)
+        attention_mask = encoded_text['attention_mask'].squeeze(0)
+        
+        # Load image
+        image_path = os.path.join(self.data_path, 'images', sample['image_filename'])
+        image = Image.open(image_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Get labels
+        is_misinformation = 1 if sample['is_misinformation'] else 0
+        campaign_id = sample.get('campaign_id', -1)  # -1 if not part of a campaign
+        
+        return {
+            'text': {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+            },
+            'image': image,
+            'labels': {
+                'is_misinformation': torch.tensor(is_misinformation, dtype=torch.long),
+                'campaign_id': torch.tensor(campaign_id, dtype=torch.long),
+            },
+            'metadata': {
+                'post_id': sample['post_id'],
+                'platform': sample['platform'],
+                'timestamp': sample['timestamp'],
+            }
+        }
+
+class StreamingDataset(Dataset):
+    """Dataset for simulating a streaming data source."""
+    
+    def __init__(self, samples, data_path, transform=None, tokenizer=None, max_length=512):
+        self.samples = samples
+        self.data_path = data_path
+        self.transform = transform
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # Load text
+        text = sample['text']
+        
+        # Tokenize text
+        encoded_text = self.tokenizer(
+            text,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        # Extract relevant tensors and squeeze batch dimension
+        input_ids = encoded_text['input_ids'].squeeze(0)
+        attention_mask = encoded_text['attention_mask'].squeeze(0)
+        
+        # Load image
+        image_path = os.path.join(self.data_path, 'images', sample['image_filename'])
+        image = Image.open(image_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Get labels
+        is_misinformation = 1 if sample['is_misinformation'] else 0
+        campaign_id = sample.get('campaign_id', -1)  # -1 if not part of a campaign
+        
+        return {
+            'text': {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+            },
+            'image': image,
+            'labels': {
+                'is_misinformation': torch.tensor(is_misinformation, dtype=torch.long),
+                'campaign_id': torch.tensor(campaign_id, dtype=torch.long),
+            },
+            'metadata': {
+                'post_id': sample['post_id'],
+                'platform': sample['platform'],
+                'timestamp': sample['timestamp'],
+            }
+        }
+
+def generate_synthetic_dataset(config, num_samples=1000):
+    """
+    Generate a synthetic dataset for testing the misinformation detection system.
+    
+    This function creates a balanced dataset of misinformation and legitimate content
+    with associated metadata.
+    
+    Args:
+        config: Configuration object
+        num_samples: Number of samples to generate
+    
+    Returns:
+        None (saves dataset to disk)
+    """
+    # Create directory structure
+    os.makedirs(os.path.join(config.data_path, "images"), exist_ok=True)
+    
+    # Generate random data
+    samples = []
+    
+    # Define platforms
+    platforms = ['twitter', 'facebook', 'instagram', 'other']
+    
+    # Define campaign IDs for coordinated content
+    campaign_ids = [f"campaign_{i}" for i in range(10)]
+    
+    # Create a base timestamp
+    base_timestamp = datetime.now() - timedelta(days=30)
+    
+    for i in range(num_samples):
+        # Generate metadata
+        post_id = f"post_{i}"
+        platform = random.choice(platforms)
+        
+        # Decide if this is misinformation
+        is_misinformation = random.random() < 0.5
+        
+        # Decide if this is part of a campaign
+        is_campaign = is_misinformation and random.random() < 0.7
+        campaign_id = random.choice(campaign_ids) if is_campaign else None
+        
+        # Generate timestamp (coordinated posts have closer timestamps)
+        if is_campaign:
+            # Posts in the same campaign have timestamps within a few hours
+            campaign_base_time = base_timestamp + timedelta(days=random.randint(0, 29))
+            timestamp = campaign_base_time + timedelta(hours=random.randint(0, 12))
+        else:
+            timestamp = base_timestamp + timedelta(days=random.randint(0, 29), 
+                                                  hours=random.randint(0, 23))
+        
+        # Generate text content
+        if is_misinformation:
+            text = f"Breaking news! Shocking discovery reveals {random.choice(['hidden truth', 'secret conspiracy', 'alarming facts'])} about {random.choice(['politics', 'health', 'economy'])}. {random.choice(['Must share!', 'They don\\'t want you to know!', 'Share before deleted!'])}"
+        else:
+            text = f"New report from {random.choice(['research institute', 'university study', 'official source'])} provides {random.choice(['updates', 'findings', 'information'])} on {random.choice(['current events', 'scientific discoveries', 'social trends'])}. {random.choice(['Interesting results.', 'More research needed.', 'Experts weigh in.'])}"
+        
+        # Create empty image (in practice, we would use real images)
+        image_filename = f"image_{i}.jpg"
+        image_path = os.path.join(config.data_path, "images", image_filename)
+        
+        # For synthetic dataset, create solid color images
+        # Red tint for misinformation, blue for legitimate (just for demonstration)
+        img_size = (config.image_size, config.image_size)
+        if is_misinformation:
+            img_array = np.zeros((img_size[0], img_size[1], 3), dtype=np.uint8)
+            img_array[:, :, 0] = 200  # Red channel
+            img_array[:, :, 1:] = 100
+        else:
+            img_array = np.zeros((img_size[0], img_size[1], 3), dtype=np.uint8)
+            img_array[:, :, 2] = 200  # Blue channel
+            img_array[:, :, :2] = 100
+            
+        # Add noise to make images unique
+        noise = np.random.randint(0, 50, img_array.shape, dtype=np.uint8)
+        img_array = np.clip(img_array + noise, 0, 255)
+        
+        img = Image.fromarray(img_array)
+        img.save(image_path)
+        
+        # Create sample
+        sample = {
+            'post_id': post_id,
+            'platform': platform,
+            'timestamp': timestamp.timestamp(),
+            'text': text,
+            'image_filename': image_filename,
+            'is_misinformation': is_misinformation,
+        }
+        
+        if campaign_id is not None:
+            sample['campaign_id'] = campaign_id
+            
+        samples.append(sample)
+    
+    # Split the dataset
+    random.shuffle(samples)
+    train_size = int(config.train_ratio * num_samples)
+    val_size = int(config.val_ratio * num_samples)
+    
+    train_samples = samples[:train_size]
+    val_samples = samples[train_size:train_size+val_size]
+    test_samples = samples[train_size+val_size:]
+    
+    # Create metadata files
+    for split, split_samples in [('train', train_samples), ('val', val_samples), ('test', test_samples)]:
+        metadata = {
+            'samples': split_samples,
+            'created_at': datetime.now().isoformat(),
+            'num_samples': len(split_samples)
+        }
+        
+        with open(os.path.join(config.data_path, f"{split}_metadata.json"), 'w') as f:
+            json.dump(metadata, f, default=str)
+    
+    print(f"Generated synthetic dataset with {num_samples} samples:")
+    print(f"  - Train: {len(train_samples)}")
+    print(f"  - Val: {len(val_samples)}")
+    print(f"  - Test: {len(test_samples)}")
+    print(f"Data saved to {config.data_path}")
+
+def create_stream_simulation(config, samples_per_minute=100, duration_minutes=10):
+    """
+    Create a simulated stream of content for testing real-time processing.
+    
+    Args:
+        config: Configuration object
+        samples_per_minute: Number of samples to process per minute
+        duration_minutes: Duration of the simulation in minutes
+        
+    Returns:
+        tuple: (data_loader, samples_per_minute, duration_minutes)
+    """
+    # Load the test dataset
+    with open(os.path.join(config.data_path, "test_metadata.json"), 'r') as f:
+        test_metadata = json.load(f)
+    
+    test_samples = test_metadata['samples']
+    
+    # Create a streaming dataset
+    transform = transforms.Compose([
+        transforms.Resize((config.image_size, config.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+    
+    tokenizer = BertTokenizer.from_pretrained(config.text_model_name)
+    
+    stream_dataset = StreamingDataset(
+        test_samples, 
+        config.data_path,
+        transform=transform,
+        tokenizer=tokenizer,
+        max_length=config.max_text_length
+    )
+    
+    # Create a data loader with the appropriate batch size
+    batch_size = max(1, samples_per_minute // 60)  # Adjust to achieve desired rate
+    
+    stream_loader = DataLoader(
+        stream_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    return stream_loader, samples_per_minute, duration_minutes
+
+def load_case_study(case_name, config):
+    """
+    Load a specific case study for targeted evaluation.
+    
+    Args:
+        case_name: Name of the case study
+        config: Configuration object
+        
+    Returns:
+        list: List of case study data points
+    """
+    case_studies = {
+        'health': {
+            'description': 'Health misinformation campaign about vaccines',
+            'campaign_id': 'campaign_vax_2023',
+            'platforms': ['twitter', 'facebook', 'instagram']
+        },
+        'election': {
+            'description': 'Election disinformation targeting voter sentiment',
+            'campaign_id': 'campaign_election_2024',
+            'platforms': ['twitter', 'facebook']
+        },
+        'climate': {
+            'description': 'Climate change misinformation network',
+            'campaign_id': 'campaign_climate_2023',
+            'platforms': ['twitter', 'facebook', 'instagram', 'other']
+        },
+        'financial': {
+            'description': 'Financial scam campaign',
+            'campaign_id': 'campaign_finance_2023',
+            'platforms': ['twitter', 'facebook']
+        }
+    }
+    
+    if case_name not in case_studies:
+        raise ValueError(f"Case study '{case_name}' not found. Available options: {list(case_studies.keys())}")
+    
+    case_info = case_studies[case_name]
+    
+    # For demonstration purposes, we'll create synthetic case study data
+    # In a real implementation, this would load from pre-existing case study files
+    
+    # Generate case study data
+    case_data = []
+    
+    # Create a base timestamp
+    base_timestamp = datetime.now() - timedelta(days=7)
+    
+    for i in range(50):  # 50 posts in the case study
+        platform = random.choice(case_info['platforms'])
+        
+        # All posts in the case study are part of the same campaign
+        is_misinformation = random.random() < 0.8  # 80% are misinformation
+        
+        # Posts in the case study have timestamps within 24 hours
+        timestamp = base_timestamp + timedelta(hours=random.randint(0, 24))
+        
+        # Generate text content tailored to the case study
+        if case_name == 'health':
+            if is_misinformation:
+                text = f"ALERT: New study proves vaccines cause {random.choice(['autism', 'infertility', 'DNA mutation'])}! {random.choice(['Big pharma hiding the truth!', 'Doctors won\\'t tell you this!', 'Share to save lives!'])}"
+            else:
+                text = f"New research from {random.choice(['CDC', 'WHO', 'Johns Hopkins'])} confirms vaccine safety and effectiveness against {random.choice(['multiple diseases', 'new variants', 'serious illness'])}."
+        
+        elif case_name == 'election':
+            if is_misinformation:
+                text = f"BREAKING: Evidence of {random.choice(['vote rigging', 'ballot harvesting', 'foreign interference'])} in {random.choice(['swing states', 'key districts', 'mail-in ballots'])}! The election is being stolen!"
+            else:
+                text = f"Election officials report {random.choice(['normal turnout', 'secure voting', 'standard procedures'])} across polling stations. {random.choice(['No irregularities detected.', 'Process running smoothly.', 'Security measures effective.'])}"
+        
+        elif case_name == 'climate':
+            if is_misinformation:
+                text = f"Scientists ADMIT: {random.choice(['Global warming is natural', 'Climate change is a hoax', 'CO2 is good for the planet'])}! {random.choice(['Green agenda exposed!', 'Follow the money!', 'Energy crisis manufactured!'])}"
+            else:
+                text = f"New climate data from {random.choice(['NASA', 'NOAA', 'UN Climate Panel'])} shows {random.choice(['record temperatures', 'accelerating ice melt', 'rising sea levels'])} consistent with climate models."
+        
+        elif case_name == 'financial':
+            if is_misinformation:
+                text = f"INSIDER SECRET: Invest in {random.choice(['this crypto', 'this penny stock', 'this new token'])} before {random.choice(['it skyrockets', 'big announcement tomorrow', 'billionaires buy it all'])}! {random.choice(['10,000% gains guaranteed!', 'Limited time opportunity!', 'Join our exclusive group!'])}"
+            else:
+                text = f"Financial analysts advise {random.choice(['caution with speculative investments', 'diversification strategies', 'long-term planning'])} amid {random.choice(['market volatility', 'economic indicators', 'sector performance'])}"
+        
+        # For synthetic dataset, create case-specific images
+        image_path = os.path.join(config.data_path, "images", f"case_{case_name}_{i}.jpg")
+        
+        img_size = (config.image_size, config.image_size)
+        if case_name == 'health':
+            # Health misinformation: red with a medical symbol
+            img_array = np.ones((img_size[0], img_size[1], 3), dtype=np.uint8) * 200
+            img_array[:, :, 0] = 250  # Red tint for misinformation
+            img_array[:, :, 1:] = 100
+        elif case_name == 'election':
+            # Election: blue and red pattern
+            img_array = np.ones((img_size[0], img_size[1], 3), dtype=np.uint8) * 150
+            img_array[:, :, 0] = 200  # Red
+            img_array[:, :, 2] = 200  # Blue
+        elif case_name == 'climate':
+            # Climate: green and blue pattern
+            img_array = np.ones((img_size[0], img_size[1], 3), dtype=np.uint8) * 100
+            img_array[:, :, 1] = 200  # Green
+            img_array[:, :, 2] = 180  # Blue
+        elif case_name == 'financial':
+            # Financial: gold/yellow pattern
+            img_array = np.ones((img_size[0], img_size[1], 3), dtype=np.uint8) * 120
+            img_array[:, :, 0] = 220  # Red
+            img_array[:, :, 1] = 220  # Green
+        
+        # Add noise to make images unique
+        noise = np.random.randint(0, 50, img_array.shape, dtype=np.uint8)
+        img_array = np.clip(img_array + noise, 0, 255)
+        
+        img = Image.fromarray(img_array)
+        img.save(image_path)
+        
+        # Create sample
+        case_data.append({
+            'id': f"{case_name}_{i}",
+            'platform': platform,
+            'timestamp': timestamp.timestamp(),
+            'text': text,
+            'image_path': image_path,
+            'is_misinformation': is_misinformation,
+            'case_study': case_name,
+            'campaign_id': case_info['campaign_id']
+        })
+    
+    print(f"Created synthetic case study '{case_name}' with {len(case_data)} posts")
+    return case_data
+
+def preprocess_text(text, max_length=512):
+    """
+    Preprocess text for the model.
+    
+    Args:
+        text: Input text
+        max_length: Maximum sequence length
+        
+    Returns:
+        str: Preprocessed text
+    """
+    # Basic text preprocessing
+    # Remove extra whitespace
+    text = ' '.join(text.split())
+    
+    # Truncate if needed
+    if len(text.split()) > max_length:
+        text = ' '.join(text.split()[:max_length])
+    
+    return text
+
+def preprocess_image(image_path, target_size=(224, 224)):
+    """
+    Preprocess image for the model.
+    
+    Args:
+        image_path: Path to the image
+        target_size: Target size for resizing
+        
+    Returns:
+        PIL.Image: Preprocessed image
+    """
+    # Load and preprocess image
+    image = Image.open(image_path).convert('RGB')
+    
+    # Resize
+    image = image.resize(target_size, Image.LANCZOS)
+    
+    return image
