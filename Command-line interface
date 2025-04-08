@@ -1,0 +1,169 @@
+"""
+Main script for the Multimodal Misinformation Detection System.
+
+This script demonstrates the usage of the misinformation detection system
+by running a complete pipeline from data generation to evaluation.
+"""
+
+import os
+import argparse
+import torch
+import json
+
+# Import modules
+from config import get_config
+from data_utils import generate_synthetic_dataset, create_stream_simulation, load_case_study
+from system_implementation import CampaignDetectionSystem
+
+def main(args):
+    """
+    Main function to run the misinformation detection system.
+    
+    Args:
+        args: Command-line arguments
+    """
+    # Initialize configuration
+    config = get_config(args.config_type)
+    
+    # Update configuration with command-line arguments
+    if args.data_path:
+        config.data_path = args.data_path
+    if args.output_path:
+        config.output_path = args.output_path
+    if args.batch_size:
+        config.batch_size = args.batch_size
+    if args.num_epochs:
+        config.num_epochs = args.num_epochs
+    
+    # Print configuration
+    print("Configuration:")
+    print(config)
+    
+    # Create directories
+    os.makedirs(config.data_path, exist_ok=True)
+    os.makedirs(config.output_path, exist_ok=True)
+    os.makedirs(config.model_save_path, exist_ok=True)
+    os.makedirs(config.log_path, exist_ok=True)
+    
+    # Generate synthetic dataset if requested
+    if args.generate_data:
+        print("Generating synthetic dataset...")
+        generate_synthetic_dataset(config, num_samples=args.num_samples)
+    
+    # Initialize the system
+    print("Initializing the misinformation detection system...")
+    system = CampaignDetectionSystem(config)
+    
+    # Load pretrained models if available and not training
+    if not args.train and not system.load_pretrained_models():
+        print("Pretrained models not available. Please train the models first.")
+        if not args.force_continue:
+            return
+    
+    # Run requested operations
+    if args.train:
+        # Prepare data loaders
+        print("Preparing data loaders...")
+        train_loader, val_loader, test_loader = system.prepare_data_loaders()
+        
+        # Train the model
+        print("Training the misinformation detection model...")
+        system.train(train_loader, val_loader, num_epochs=config.num_epochs)
+        
+        # Evaluate the model
+        if args.evaluate:
+            print("Evaluating the model...")
+            metrics = system.evaluate(test_loader)
+    
+    elif args.evaluate:
+        # Prepare data loaders
+        print("Preparing data loaders...")
+        _, _, test_loader = system.prepare_data_loaders()
+        
+        # Evaluate the model
+        print("Evaluating the model...")
+        metrics = system.evaluate(test_loader)
+    
+    if args.stream:
+        # Create a simulated stream for real-time processing demonstration
+        print("Simulating real-time content stream...")
+        stream_loader, samples_per_minute, duration_minutes = create_stream_simulation(
+            config, samples_per_minute=args.stream_rate, duration_minutes=args.stream_duration
+        )
+        
+        # Process the stream
+        print(f"Processing stream at {samples_per_minute} posts per minute for {duration_minutes} minutes...")
+        stream_results = system.process_real_time_stream(
+            stream_loader, max_posts=samples_per_minute * duration_minutes
+        )
+        
+        # Print stream results
+        print("\nStream Processing Results:")
+        print(f"Processed {stream_results['processing_stats']['posts_processed']} posts")
+        print(f"Processing rate: {stream_results['processing_stats']['posts_per_minute']:.1f} posts/minute")
+        print(f"Detected {len(stream_results['misinformation_posts'])} misinformation posts")
+        print(f"Identified {len(stream_results['coordination_clusters'])} coordination clusters")
+    
+    if args.case_study:
+        # Load and analyze case study
+        print(f"Loading case study: {args.case_study}")
+        case_data = load_case_study(args.case_study, config)
+        
+        # Analyze case study
+        case_results = system.analyze_case_study(case_data)
+        
+        # Print case study results
+        print("\nCase Study Results:")
+        print(f"Accuracy: {case_results['accuracy']:.4f}")
+        print(f"F1 Score: {case_results['f1']:.4f}")
+        print(f"Response Time: {case_results['response_time']:.2f}s")
+        print(f"Coordination Score: {case_results['coordination_score']:.4f}")
+        print(f"Coordinated Posts: {len(case_results['coordinated_posts'])}")
+    
+    print("\nDemonstration complete!")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Multimodal Misinformation Detection System")
+    
+    # Configuration options
+    parser.add_argument("--config-type", type=str, default="default",
+                        choices=["default", "high_performance", "lightweight", "real_time"],
+                        help="Configuration type to use")
+    parser.add_argument("--data-path", type=str, help="Path to dataset")
+    parser.add_argument("--output-path", type=str, help="Path for outputs")
+    parser.add_argument("--batch-size", type=int, help="Batch size for training")
+    parser.add_argument("--num-epochs", type=int, help="Number of training epochs")
+    
+    # Operation modes
+    parser.add_argument("--generate-data", action="store_true",
+                        help="Generate synthetic dataset")
+    parser.add_argument("--num-samples", type=int, default=5000,
+                        help="Number of samples to generate")
+    parser.add_argument("--train", action="store_true",
+                        help="Train the model")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Evaluate the model")
+    parser.add_argument("--stream", action="store_true",
+                        help="Run real-time stream processing simulation")
+    parser.add_argument("--stream-rate", type=int, default=5000,
+                        help="Samples per minute for stream simulation")
+    parser.add_argument("--stream-duration", type=int, default=1,
+                        help="Duration in minutes for stream simulation")
+    parser.add_argument("--case-study", type=str,
+                        choices=["health", "election", "climate", "financial"],
+                        help="Run specific case study analysis")
+    parser.add_argument("--force-continue", action="store_true",
+                        help="Continue even if pretrained models are not available")
+    
+    args = parser.parse_args()
+    
+    # Default behavior if no operation specified
+    if not any([args.generate_data, args.train, args.evaluate, args.stream, args.case_study]):
+        print("No operation specified. Running complete demonstration...")
+        args.generate_data = True
+        args.train = True
+        args.evaluate = True
+        args.stream = True
+        args.case_study = "health"
+    
+    main(args)
