@@ -1,0 +1,919 @@
+"""
+System implementation for the Multimodal Misinformation Detection System.
+
+This module provides the main system implementation, integrating the various components
+into a cohesive system for detecting coordinated misinformation campaigns.
+"""
+
+import os
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import networkx as nx
+from torch.utils.data import DataLoader
+from transformers import BertTokenizer, ViTFeatureExtractor
+import torchvision.transforms as transforms
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+
+# Import local modules
+# In a real implementation, these would be proper imports
+# For this demonstration, we assume these classes are available
+from data_utils import SocialMediaDataset
+from model_components import MisinformationDetector, CoordinationDetector
+
+class CampaignDetectionSystem:
+    """Main system for detecting coordinated misinformation campaigns."""
+    
+    def __init__(self, config):
+        """
+        Initialize the campaign detection system.
+        
+        Args:
+            config: Configuration object
+        """
+        self.config = config
+        
+        # Initialize tokenizer and feature extractor
+        self.tokenizer = BertTokenizer.from_pretrained(config.text_model_name)
+        self.feature_extractor = ViTFeatureExtractor.from_pretrained(config.image_model_name)
+        
+        # Initialize models
+        self.misinformation_detector = MisinformationDetector(config).to(config.device)
+        self.coordination_detector = CoordinationDetector(
+            in_channels=config.fusion_hidden_size,
+            hidden_channels=config.fusion_hidden_size // 2
+        ).to(config.device)
+        
+        # Setup transforms for images
+        self.transform = transforms.Compose([
+            transforms.Resize((config.image_size, config.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        # Feature cache for coordination analysis
+        self.feature_cache = {}
+        
+        # Create output directories
+        os.makedirs(config.model_save_path, exist_ok=True)
+        os.makedirs(config.log_path, exist_ok=True)
+        os.makedirs(os.path.join(config.output_path, "visualizations"), exist_ok=True)
+        
+        print(f"Initialized Campaign Detection System using device: {config.device}")
+        
+    def prepare_data_loaders(self):
+        """
+        Prepare data loaders for training and evaluation.
+        
+        Returns:
+            tuple: (train_loader, val_loader, test_loader)
+        """
+        # Create datasets
+        train_dataset = SocialMediaDataset(
+            self.config.data_path, 
+            split='train',
+            transform=self.transform,
+            tokenizer=self.tokenizer,
+            max_length=self.config.max_text_length
+        )
+        
+        val_dataset = SocialMediaDataset(
+            self.config.data_path, 
+            split='val',
+            transform=self.transform,
+            tokenizer=self.tokenizer,
+            max_length=self.config.max_text_length
+        )
+        
+        test_dataset = SocialMediaDataset(
+            self.config.data_path, 
+            split='test',
+            transform=self.transform,
+            tokenizer=self.tokenizer,
+            max_length=self.config.max_text_length
+        )
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory
+        )
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory
+        )
+        
+        print(f"Prepared data loaders with {len(train_dataset)} training, "
+              f"{len(val_dataset)} validation, and {len(test_dataset)} test samples")
+        
+        return train_loader, val_loader, test_loader
+    
+    def train(self, train_loader, val_loader, num_epochs=None):
+        """
+        Train the misinformation detection model.
+        
+        Args:
+            train_loader: DataLoader for training data
+            val_loader: DataLoader for validation data
+            num_epochs: Number of training epochs (if None, use config value)
+            
+        Returns:
+            dict: Training results
+        """
+        if num_epochs is None:
+            num_epochs = self.config.num_epochs
+            
+        # Define optimizers
+        misinfo_optimizer = torch.optim.AdamW(
+            self.misinformation_detector.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay
+        )
+        
+        # Define loss functions
+        misinfo_criterion = nn.CrossEntropyLoss()
+        
+        # Training loop
+        best_val_acc = 0.0
+        training_stats = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': []
+        }
+        
+        print(f"Starting training for {num_epochs} epochs...")
+        
+        for epoch in range(num_epochs):
+            # Training phase
+            self.misinformation_detector.train()
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+            
+            start_time = time.time()
+            
+            for batch_idx, batch in enumerate(train_loader):
+                # Move batch to device
+                input_ids = batch['text']['input_ids'].to(self.config.device)
+                attention_mask = batch['text']['attention_mask'].to(self.config.device)
+                images = batch['image'].to(self.config.device)
+                labels = batch['labels']['is_misinformation'].to(self.config.device)
+                
+                # Forward pass
+                misinfo_optimizer.zero_grad()
+                outputs = self.misinformation_detector(input_ids, attention_mask, images)
+                
+                # Compute loss
+                loss = misinfo_criterion(outputs, labels)
+                
+                # Backward pass
+                loss.backward()
+                misinfo_optimizer.step()
+                
+                # Track statistics
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                train_total += labels.size(0)
+                train_correct += predicted.eq(labels).sum().item()
+                
+                # Print progress
+                if (batch_idx + 1) % 50 == 0:
+                    elapsed_time = time.time() - start_time
+                    print(f"Epoch [{epoch+1}/{num_epochs}] | Batch [{batch_idx+1}/{len(train_loader)}] | "
+                          f"Loss: {train_loss/(batch_idx+1):.4f} | "
+                          f"Acc: {100.*train_correct/train_total:.2f}% | "
+                          f"Time: {elapsed_time:.2f}s")
+            
+            # Validation phase
+            self.misinformation_detector.eval()
+            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(val_loader):
+                    # Move batch to device
+                    input_ids = batch['text']['input_ids'].to(self.config.device)
+                    attention_mask = batch['text']['attention_mask'].to(self.config.device)
+                    images = batch['image'].to(self.config.device)
+                    labels = batch['labels']['is_misinformation'].to(self.config.device)
+                    
+                    # Forward pass
+                    outputs = self.misinformation_detector(input_ids, attention_mask, images)
+                    
+                    # Compute loss
+                    loss = misinfo_criterion(outputs, labels)
+                    
+                    # Track statistics
+                    val_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    val_total += labels.size(0)
+                    val_correct += predicted.eq(labels).sum().item()
+            
+            # Compute epoch statistics
+            train_loss /= len(train_loader)
+            train_acc = 100. * train_correct / train_total
+            val_loss /= len(val_loader)
+            val_acc = 100. * val_correct / val_total
+            
+            # Save statistics
+            training_stats['train_loss'].append(train_loss)
+            training_stats['train_acc'].append(train_acc)
+            training_stats['val_loss'].append(val_loss)
+            training_stats['val_acc'].append(val_acc)
+            
+            print(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {train_loss:.4f} | "
+                  f"Train Acc: {train_acc:.2f}% | "
+                  f"Val Loss: {val_loss:.4f} | "
+                  f"Val Acc: {val_acc:.2f}%")
+            
+            # Save the best model
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                print(f"Saving best model with validation accuracy: {best_val_acc:.2f}%")
+                
+                # Save model
+                torch.save(self.misinformation_detector.state_dict(), 
+                          os.path.join(self.config.model_save_path, "best_misinfo_detector.pth"))
+                
+        print(f"Training completed. Best validation accuracy: {best_val_acc:.2f}%")
+        
+        # Plot training curves
+        self._plot_training_curves(training_stats)
+        
+        return training_stats
+    
+    def _plot_training_curves(self, stats):
+        """
+        Plot training and validation curves.
+        
+        Args:
+            stats: Dictionary of training statistics
+        """
+        # Create figure
+        plt.figure(figsize=(12, 5))
+        
+        # Plot loss
+        plt.subplot(1, 2, 1)
+        plt.plot(stats['train_loss'], label='Train Loss')
+        plt.plot(stats['val_loss'], label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss')
+        plt.legend()
+        plt.grid(True)
+        
+        # Plot accuracy
+        plt.subplot(1, 2, 2)
+        plt.plot(stats['train_acc'], label='Train Accuracy')
+        plt.plot(stats['val_acc'], label='Val Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy (%)')
+        plt.title('Training and Validation Accuracy')
+        plt.legend()
+        plt.grid(True)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.config.output_path, "visualizations", "training_curves.png"))
+        plt.close()
+    
+    def train_coordination_detector(self, features, edge_index, labels, batch_indices, epochs=10):
+        """
+        Train the coordination detector GNN.
+        
+        Args:
+            features: Node features [num_nodes, in_channels]
+            edge_index: Graph connectivity [2, num_edges]
+            labels: Node labels [num_nodes]
+            batch_indices: Batch assignment for nodes [num_nodes]
+            epochs: Number of training epochs
+            
+        Returns:
+            dict: Training results
+        """
+        # Move data to device
+        features = features.to(self.config.device)
+        edge_index = edge_index.to(self.config.device)
+        labels = labels.to(self.config.device)
+        batch_indices = batch_indices.to(self.config.device)
+        
+        # Define optimizer and loss function
+        optimizer = torch.optim.Adam(self.coordination_detector.parameters(), lr=0.01)
+        criterion = nn.BCELoss()
+        
+        # Training loop
+        self.coordination_detector.train()
+        training_stats = {'loss': []}
+        
+        print(f"Training coordination detector for {epochs} epochs...")
+        
+        for epoch in range(epochs):
+            # Forward pass
+            optimizer.zero_grad()
+            outputs = self.coordination_detector(features, edge_index, batch_indices)
+            
+            # Compute loss
+            loss = criterion(outputs.squeeze(), labels.float())
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            # Save loss
+            training_stats['loss'].append(loss.item())
+            
+            # Print progress
+            if (epoch + 1) % 10 == 0:
+                print(f"Coordination Detector Epoch [{epoch+1}/{epochs}] | Loss: {loss.item():.4f}")
+        
+        # Save model
+        torch.save(self.coordination_detector.state_dict(),
+                  os.path.join(self.config.model_save_path, "coordination_detector.pth"))
+        
+        print("Coordination detector training completed.")
+        
+        return training_stats
+    
+    def extract_features(self, input_ids, attention_mask, images):
+        """
+        Extract features from the misinformation detector model.
+        
+        Args:
+            input_ids: Input token IDs [batch_size, seq_length]
+            attention_mask: Attention mask [batch_size, seq_length]
+            images: Input images [batch_size, 3, height, width]
+            
+        Returns:
+            torch.Tensor: Fused features [batch_size, fusion_hidden_size]
+        """
+        self.misinformation_detector.eval()
+        
+        with torch.no_grad():
+            # Extract text and image features
+            text_features, image_features, fused_features = self.misinformation_detector.extract_features(
+                input_ids, attention_mask, images
+            )
+            
+        return fused_features
+    
+    def build_coordination_graph(self, features_list, metadata_list, threshold=None):
+        """
+        Build a graph for coordination analysis based on feature similarity.
+        
+        Args:
+            features_list: List of feature tensors
+            metadata_list: List of metadata dictionaries
+            threshold: Similarity threshold (if None, use config value)
+            
+        Returns:
+            tuple: (networkx_graph, edge_index_tensor)
+        """
+        if threshold is None:
+            threshold = self.config.similarity_threshold
+            
+        num_posts = len(features_list)
+        
+        # Create a graph
+        graph = nx.Graph()
+        
+        # Add nodes
+        for i in range(num_posts):
+            graph.add_node(i, features=features_list[i], metadata=metadata_list[i])
+        
+        # Add edges based on feature similarity and temporal proximity
+        edge_list = []
+        
+        for i in range(num_posts):
+            for j in range(i+1, num_posts):
+                # Calculate cosine similarity between features
+                sim = F.cosine_similarity(features_list[i].unsqueeze(0), features_list[j].unsqueeze(0)).item()
+                
+                # Calculate temporal proximity (assuming timestamp is in seconds)
+                try:
+                    time_i = float(metadata_list[i]['timestamp'])
+                    time_j = float(metadata_list[j]['timestamp'])
+                    time_diff = abs(time_i - time_j)
+                    
+                    # Add edge if similarity is high and posts are temporally close
+                    if sim > threshold and time_diff < self.config.coordination_time_window:
+                        graph.add_edge(i, j, weight=sim, time_diff=time_diff)
+                        edge_list.append((i, j))
+                except (ValueError, TypeError, KeyError):
+                    # If timestamp conversion fails, just use similarity
+                    if sim > threshold:
+                        graph.add_edge(i, j, weight=sim)
+                        edge_list.append((i, j))
+        
+        # Convert edge list to tensor
+        if edge_list:
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+        else:
+            # If no edges, create a dummy edge to avoid errors
+            edge_index = torch.tensor([[0], [0]], dtype=torch.long)
+        
+        return graph, edge_index
+    
+    def detect_coordination(self, post_features, metadata_list):
+        """
+        Detect coordination patterns in a set of posts.
+        
+        Args:
+            post_features: List of feature tensors
+            metadata_list: List of metadata dictionaries
+            
+        Returns:
+            tuple: (coordinated_post_indices, coordination_score)
+        """
+        # Build coordination graph
+        graph, edge_index = self.build_coordination_graph(post_features, metadata_list)
+        
+        # If no meaningful edges, return no coordination
+        if edge_index.size(1) <= 1:
+            return [], 0.0
+        
+        # Convert node features to a tensor
+        features = torch.stack(post_features)
+        
+        # Create batch indices
+        batch = torch.zeros(features.size(0), dtype=torch.long)
+        
+        # Detect coordination
+        self.coordination_detector.eval()
+        
+        with torch.no_grad():
+            coordination_score = self.coordination_detector(
+                features.to(self.config.device),
+                edge_index.to(self.config.device),
+                batch.to(self.config.device)
+            )
+        
+        # Identify coordinated posts
+        coordinated_posts = []
+        
+        if coordination_score.item() > 0.5:
+            # Use graph analysis to identify central nodes
+            if len(graph.nodes) > 0:
+                centrality = nx.betweenness_centrality(graph)
+                coordinated_posts = [i for i, c in centrality.items() if c > 0.1]
+        
+        return coordinated_posts, coordination_score.item()
+    
+    def analyze_batch(self, batch):
+        """
+        Analyze a batch of posts for misinformation and coordination.
+        
+        Args:
+            batch: Batch dictionary
+            
+        Returns:
+            dict: Analysis results
+        """
+        # Move batch to device
+        input_ids = batch['text']['input_ids'].to(self.config.device)
+        attention_mask = batch['text']['attention_mask'].to(self.config.device)
+        images = batch['image'].to(self.config.device)
+        
+        # Detect misinformation
+        self.misinformation_detector.eval()
+        
+        with torch.no_grad():
+            misinfo_outputs = self.misinformation_detector(input_ids, attention_mask, images)
+            misinfo_probs = F.softmax(misinfo_outputs, dim=1)
+            
+            # Extract features for coordination detection
+            features = self.extract_features(input_ids, attention_mask, images)
+        
+        # Convert features to CPU for graph processing
+        features_list = [f.cpu() for f in features]
+        metadata_list = batch['metadata']
+        
+        # Detect coordination
+        coordinated_posts, coordination_score = self.detect_coordination(features_list, metadata_list)
+        
+        return {
+            'misinformation_probabilities': misinfo_probs.cpu().numpy(),
+            'features': features.cpu().numpy(),
+            'coordinated_posts': coordinated_posts,
+            'coordination_score': coordination_score
+        }
+    
+    def evaluate(self, test_loader):
+        """
+        Evaluate the model on the test set.
+        
+        Args:
+            test_loader: DataLoader for test data
+            
+        Returns:
+            dict: Evaluation metrics
+        """
+        self.misinformation_detector.eval()
+        
+        all_preds = []
+        all_labels = []
+        all_probs = []
+        
+        print("Evaluating model on test set...")
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                # Move batch to device
+                input_ids = batch['text']['input_ids'].to(self.config.device)
+                attention_mask = batch['text']['attention_mask'].to(self.config.device)
+                images = batch['image'].to(self.config.device)
+                labels = batch['labels']['is_misinformation'].to(self.config.device)
+                
+                # Forward pass
+                outputs = self.misinformation_detector(input_ids, attention_mask, images)
+                
+                # Get predictions and probabilities
+                probs = F.softmax(outputs, dim=1)
+                _, preds = outputs.max(1)
+                
+                # Store predictions and labels
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of class 1 (misinformation)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision = precision_score(all_labels, all_preds)
+        recall = recall_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds)
+        auc_roc = roc_auc_score(all_labels, all_probs)
+        
+        metrics = {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'auc_roc': auc_roc
+        }
+        
+        print(f"Test Results:")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        print(f"AUC-ROC: {auc_roc:.4f}")
+        
+        # Save metrics
+        import json
+        with open(os.path.join(self.config.output_path, "evaluation_metrics.json"), 'w') as f:
+            json.dump(metrics, f, indent=4)
+        
+        return metrics
+    
+    def process_real_time_stream(self, stream_loader, max_posts=1000):
+        """
+        Process a stream of posts in real-time.
+        
+        Args:
+            stream_loader: DataLoader for streaming data
+            max_posts: Maximum number of posts to process
+            
+        Returns:
+            dict: Processing results
+        """
+        self.misinformation_detector.eval()
+        self.coordination_detector.eval()
+        
+        processed_count = 0
+        start_time = time.time()
+        
+        # Feature cache for coordination detection
+        features_list = []
+        metadata_list = []
+        
+        misinfo_posts = []
+        coord_clusters = []
+        
+        print(f"Starting real-time stream processing...")
+        
+        for batch in stream_loader:
+            # Move batch to device
+            input_ids = batch['text']['input_ids'].to(self.config.device)
+            attention_mask = batch['text']['attention_mask'].to(self.config.device)
+            images = batch['image'].to(self.config.device)
+            
+            batch_size = input_ids.size(0)
+            processed_count += batch_size
+            
+            # Detect misinformation
+            with torch.no_grad():
+                misinfo_outputs = self.misinformation_detector(input_ids, attention_mask, images)
+                misinfo_probs = F.softmax(misinfo_outputs, dim=1)
+                misinfo_preds = misinfo_probs.argmax(dim=1)
+                
+                # Extract features
+                features = self.extract_features(input_ids, attention_mask, images)
+            
+            # Store features and metadata for coordination analysis
+            for i in range(batch_size):
+                features_list.append(features[i].cpu())
+                metadata_list.append(batch['metadata'][i])
+                
+                # Track misinformation posts
+                if misinfo_preds[i].item() == 1:
+                    misinfo_posts.append({
+                        'post_id': batch['metadata'][i]['post_id'],
+                        'platform': batch['metadata'][i]['platform'],
+                        'timestamp': batch['metadata'][i]['timestamp'],
+                        'probability': misinfo_probs[i, 1].item()
+                    })
+            
+            # Detect coordination every 100 posts
+            if len(features_list) >= 100:
+                coordinated_posts, score = self.detect_coordination(features_list, metadata_list)
+                
+                if coordinated_posts:
+                    cluster = {
+                        'posts': [metadata_list[i]['post_id'] for i in coordinated_posts],
+                        'platforms': [metadata_list[i]['platform'] for i in coordinated_posts],
+                        'score': score
+                    }
+                    coord_clusters.append(cluster)
+                
+                # Print processing statistics
+                elapsed_time = time.time() - start_time
+                posts_per_minute = processed_count / (elapsed_time / 60)
+                
+                print(f"Processed {processed_count} posts in {elapsed_time:.2f}s ({posts_per_minute:.1f} posts/min)")
+                print(f"Detected {len(misinfo_posts)} misinformation posts and {len(coord_clusters)} coordination clusters")
+            
+            if processed_count >= max_posts:
+                break
+        
+        # Final coordination detection on remaining posts
+        if features_list:
+            coordinated_posts, score = self.detect_coordination(features_list, metadata_list)
+            
+            if coordinated_posts:
+                cluster = {
+                    'posts': [metadata_list[i]['post_id'] for i in coordinated_posts],
+                    'platforms': [metadata_list[i]['platform'] for i in coordinated_posts],
+                    'score': score
+                }
+                coord_clusters.append(cluster)
+        
+        # Final processing statistics
+        total_elapsed_time = time.time() - start_time
+        posts_per_minute = processed_count / (total_elapsed_time / 60)
+        
+        print(f"Stream processing complete.")
+        print(f"Total processed: {processed_count} posts in {total_elapsed_time:.2f}s ({posts_per_minute:.1f} posts/min)")
+        print(f"Detected {len(misinfo_posts)} misinformation posts and {len(coord_clusters)} coordination clusters")
+        
+        # Save results
+        results = {
+            'misinformation_posts': misinfo_posts,
+            'coordination_clusters': coord_clusters,
+            'processing_stats': {
+                'posts_processed': processed_count,
+                'elapsed_time': total_elapsed_time,
+                'posts_per_minute': posts_per_minute
+            }
+        }
+        
+        with open(os.path.join(self.config.output_path, "stream_processing_results.json"), 'w') as f:
+            import json
+            json.dump(results, f, indent=4, default=str)
+        
+        return results
+    
+    def visualize_coordination_network(self, features_list, metadata_list, threshold=None):
+        """
+        Visualize the coordination network.
+        
+        Args:
+            features_list: List of feature tensors
+            metadata_list: List of metadata dictionaries
+            threshold: Similarity threshold (if None, use config value)
+            
+        Returns:
+            networkx.Graph: Coordination graph
+        """
+        # Build coordination graph
+        graph, _ = self.build_coordination_graph(features_list, metadata_list, threshold)
+        
+        # Create a visualization
+        plt.figure(figsize=(12, 10))
+        
+        # Extract relevant attributes for visualization
+        platforms = [metadata['platform'] for metadata in metadata_list]
+        platform_colors = {
+            'twitter': 'blue',
+            'facebook': 'green',
+            'instagram': 'red',
+            'other': 'gray'
+        }
+        
+        node_colors = [platform_colors.get(p, 'gray') for p in platforms]
+        
+        # Draw the network
+        pos = nx.spring_layout(graph, seed=42)
+        nx.draw_networkx_nodes(graph, pos, node_size=100, node_color=node_colors, alpha=0.8)
+        nx.draw_networkx_edges(graph, pos, width=1, alpha=0.5)
+        
+        # Add node labels for larger clusters
+        if len(graph.nodes) < 50:  # Only show labels for smaller graphs
+            labels = {i: f"{i}" for i in graph.nodes}
+            nx.draw_networkx_labels(graph, pos, labels, font_size=8)
+        
+        # Create legend
+        legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
+                                     markerfacecolor=color, markersize=10, label=platform)
+                          for platform, color in platform_colors.items()]
+        plt.legend(handles=legend_elements, loc='upper right')
+        
+        plt.title('Coordination Network Analysis')
+        plt.axis('off')
+        
+        # Save the visualization
+        plt.savefig(os.path.join(self.config.output_path, "visualizations", "coordination_network.png"))
+        plt.close()
+        
+        print(f"Network visualization saved to {os.path.join(self.config.output_path, 'visualizations', 'coordination_network.png')}")
+        
+        return graph
+    
+    def analyze_case_study(self, case_data):
+        """
+        Analyze a specific case study.
+        
+        Args:
+            case_data: List of case study data points
+            
+        Returns:
+            dict: Analysis results
+        """
+        print(f"Analyzing case study with {len(case_data)} posts...")
+        
+        start_time = time.time()
+        
+        features_list = []
+        metadata_list = []
+        predictions = []
+        
+        for item in case_data:
+            # Tokenize text
+            encoded_text = self.tokenizer(
+                item['text'],
+                padding='max_length',
+                truncation=True,
+                max_length=self.config.max_text_length,
+                return_tensors='pt'
+            )
+            
+            input_ids = encoded_text['input_ids'].to(self.config.device)
+            attention_mask = encoded_text['attention_mask'].to(self.config.device)
+            
+            # Process image
+            image = self.transform(Image.open(item['image_path']).convert('RGB')).unsqueeze(0).to(self.config.device)
+            
+            # Detect misinformation
+            self.misinformation_detector.eval()
+            with torch.no_grad():
+                outputs = self.misinformation_detector(input_ids, attention_mask, image)
+                probs = F.softmax(outputs, dim=1)
+                pred = probs.argmax(dim=1).item()
+                
+                # Extract features
+                features = self.extract_features(input_ids, attention_mask, image)
+            
+            # Store results
+            features_list.append(features[0].cpu())
+            metadata_list.append({
+                'post_id': item['id'],
+                'platform': item['platform'],
+                'timestamp': item['timestamp']
+            })
+            
+            predictions.append({
+                'id': item['id'],
+                'is_misinformation': bool(pred),
+                'confidence': probs[0, pred].item(),
+                'ground_truth': item['is_misinformation']
+            })
+        
+        # Detect coordination
+        coordinated_posts, coordination_score = self.detect_coordination(features_list, metadata_list)
+        
+        # Calculate metrics
+        correct = sum(1 for p in predictions if p['is_misinformation'] == p['ground_truth'])
+        accuracy = correct / len(predictions) if predictions else 0
+        
+        true_positives = sum(1 for p in predictions if p['is_misinformation'] and p['ground_truth'])
+        predicted_positives = sum(1 for p in predictions if p['is_misinformation'])
+        actual_positives = sum(1 for p in predictions if p['ground_truth'])
+        
+        precision = true_positives / predicted_positives if predicted_positives > 0 else 0
+        recall = true_positives / actual_positives if actual_positives > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        # Total time
+        elapsed_time = time.time() - start_time
+        
+        print(f"Case study analysis completed in {elapsed_time:.2f}s")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        print(f"Coordination Score: {coordination_score:.4f}")
+        print(f"Detected {len(coordinated_posts)} coordinated posts")
+        
+        # Create visualization
+        graph = self.visualize_coordination_network(features_list, metadata_list)
+        
+        # Return results
+        results = {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'response_time': elapsed_time,
+            'coordination_score': coordination_score,
+            'coordinated_posts': [metadata_list[i]['post_id'] for i in coordinated_posts],
+            'predictions': predictions,
+            'graph': graph
+        }
+        
+        # Save results
+        with open(os.path.join(self.config.output_path, "case_study_results.json"), 'w') as f:
+            import json
+            # Convert graph to list of edges for JSON serialization
+            results_json = results.copy()
+            results_json['graph'] = [{'source': u, 'target': v} for u, v in graph.edges]
+            json.dump(results_json, f, indent=4, default=str)
+        
+        return results
+    
+    def load_pretrained_models(self):
+        """
+        Load pretrained models from saved checkpoints.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        misinfo_path = os.path.join(self.config.model_save_path, "best_misinfo_detector.pth")
+        coord_path = os.path.join(self.config.model_save_path, "coordination_detector.pth")
+        
+        if os.path.exists(misinfo_path):
+            self.misinformation_detector.load_state_dict(torch.load(misinfo_path, map_location=self.config.device))
+            print(f"Loaded misinformation detector from {misinfo_path}")
+        else:
+            print(f"Warning: Misinformation detector checkpoint not found at {misinfo_path}")
+            return False
+        
+        if os.path.exists(coord_path):
+            self.coordination_detector.load_state_dict(torch.load(coord_path, map_location=self.config.device))
+            print(f"Loaded coordination detector from {coord_path}")
+        else:
+            print(f"Warning: Coordination detector checkpoint not found at {coord_path}")
+            return False
+        
+        return True
+    
+    def save_models(self):
+        """
+        Save models to disk.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            os.makedirs(self.config.model_save_path, exist_ok=True)
+            
+            misinfo_path = os.path.join(self.config.model_save_path, "misinfo_detector.pth")
+            coord_path = os.path.join(self.config.model_save_path, "coordination_detector.pth")
+            
+            torch.save(self.misinformation_detector.state_dict(), misinfo_path)
+            torch.save(self.coordination_detector.state_dict(), coord_path)
+            
+            print(f"Models saved to {self.config.model_save_path}")
+            return True
+        except Exception as e:
+            print(f"Error saving models: {e}")
+            return False
